@@ -1,0 +1,369 @@
+name: Sibirskiy Medved (dozor taygi)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write  # retire step cancels the older run after handover
+
+# Generational handover (OVERLAPPING, not cancel-on-start): the job is
+# hard-capped at 4h10m (timeout-minutes). At 3h55m job-elapsed the running
+# generation dispatches its successor. The successor installs, verifies
+# end-to-end and republishes its own tunnel (~5 min), then cancels the
+# older generation at its first check - the subscription files flip to
+# the successor's endpoint within seconds. Users never notice. If the
+# dispatch inside this job never happened (crash/timeout), Nochnoy Dozor
+# fires on this run's completion (workflow_run event) and starts the
+# next generation within minutes. timeout-minutes is only the backstop.
+
+jobs:
+  proxy:
+    # Never run on the template repo itself (would burn minutes
+    # and push endpoint files to main). User copies run elsewhere.
+    if: github.repository != 'X5Coder/IPNET'
+    runs-on: ubuntu-latest
+    timeout-minutes: 250  # 4h10m hard stop; successor retires this run far earlier
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Start local HTTP proxy (self-test + manual use inside runner)
+        run: |
+          date +%s > /tmp/job_start   # job-elapsed clock for handover dispatch
+          echo "Starting proxy on 0.0.0.0:8080 ..."
+          PORT=8080 PROXY_USER=taezhnyyvolk PROXY_PASS='Volk_Taiga_2026_Krepkiy!' python3 severnyy_medved.py > /tmp/proxy.log 2>&1 &
+          echo $! > /tmp/proxy.pid
+          sleep 3
+          cat /tmp/proxy.log
+          curl -s http://127.0.0.1:8080/health | head -3
+          echo "Proxy ready (local only - public ingress is cloudflared)"
+
+      - name: Start sing-box (VMess + WebSocket, the ONLY public leg)
+        run: |
+          echo "Installing sing-box ..."
+          SB_VER="1.14.2"
+          curl -sL --max-time 120 "https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/sing-box-${SB_VER}-linux-amd64.tar.gz" -o /tmp/sb.tgz
+          tar xz -f /tmp/sb.tgz -C /tmp
+          cp /tmp/sing-box-*/sing-box /tmp/sing-box && chmod +x /tmp/sing-box
+          /tmp/sing-box version
+          echo "Starting vmess-ws server on 127.0.0.1:10086 ..."
+          /tmp/sing-box run -c matryoshka_dvigatel.json > /tmp/ss.log 2>&1 &
+          echo $! > /tmp/ss.pid
+          sleep 3
+          cat /tmp/ss.log
+          ss -tlnp | grep -E "10086|8080" || netstat -tlnp | grep -E "10086|8080" || true
+          # GATE: the vmess inbound must be up (cloudflared dials it).
+          if grep -q "vmess" /tmp/ss.log && (ss -tln 2>/dev/null || netstat -tln 2>/dev/null) | grep -q ":10086"; then
+            echo "vmess-ws listen OK (127.0.0.1:10086)"
+          else
+            echo "FATAL: vmess inbound did NOT start"
+            cat /tmp/ss.log || true
+            exit 1
+          fi
+          echo "--- local egress IP (should be US) ---"
+          curl -s --max-time 15 -x 'http://taezhnyyvolk:Volk_Taiga_2026_Krepkiy!@127.0.0.1:8080' http://httpbin.org/ip || echo "LOCAL HTTP FAIL"
+          echo ""
+
+      - name: Install cloudflared
+        run: |
+          curl -sL --max-time 120 "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb" -o /tmp/cfd.deb
+          sudo dpkg -i /tmp/cfd.deb
+          cloudflared --version
+
+      - name: Taezhnyy osmotr (sliyaniye reki)
+        run: |
+          _push() {
+            # Push published files; one rebase+retry. Never kills the job -
+            # a loud warning is better than a dead proxy. README/links
+            # converge on the next handover publish.
+            git push && return 0
+            echo "push failed - rebasing and retrying once ..."
+            git rebase --abort 2>/dev/null || true
+            git pull --rebase --autostash || { echo "WARNING: rebase failed - endpoint NOT published"; echo "### ⚠️ publish failed - README link may be stale" >> $GITHUB_STEP_SUMMARY; return 1; }
+            git add medvezhiy_sled.txt volchiy_sled.txt zayachiy_sled.txt README.md || { echo "WARNING: nothing to add"; return 1; }
+            if git diff --cached --quiet; then
+              echo "nothing to commit after rebase - remote already up to date"
+              return 0
+            fi
+            git commit -m "publish cloudflared ${CF_HOST:-tunnel} (retry)" || return 1
+            git push || { echo "WARNING: push retry failed - endpoint NOT published"; echo "### ⚠️ publish failed - README link may be stale" >> $GITHUB_STEP_SUMMARY; return 1; }
+          }
+          _m1() {
+            # Fixed URLs, evergreen content: volchiy_sled.txt (plain vmess://
+            # link) and zayachiy_sled.txt (base64 subscription for v2rayNG/NekoBox
+            # auto-update). The URLs never change; only the content tracks
+            # the live tunnel hostname.
+            CF_HOST="$(cat medvezhiy_sled.txt 2>/dev/null | tr -d ' \r\n')"
+            [ -z "$CF_HOST" ] && return 0
+            UUID="$(python3 -c "import json;print(json.load(open('matryoshka_dvigatel.json'))['inbounds'][0]['users'][0]['uuid'])")"
+            [ -z "$UUID" ] && return 0
+            VJSON=$(printf '{"v":"2","ps":"VOLK-TAYGA","add":"%s","port":"443","id":"%s","aid":"0","net":"ws","type":"none","host":"%s","path":"/taiga","tls":"tls"}' "$CF_HOST" "$UUID" "$CF_HOST")
+            LINK="vmess://$(printf '%s' "$VJSON" | base64 -w0)"
+            printf '%s' "$LINK" > volchiy_sled.txt
+            printf '%s' "$LINK" | base64 -w0 > zayachiy_sled.txt
+            export VOLK_LINK="$LINK"
+            echo "zayachiy_sled.txt + volchiy_sled.txt published (vmess link)"
+          }
+          _u2() {
+            # Replace {{SUBSCRIPTION_URL}} placeholder with actual repo URL
+            export VOLK_SUB="https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/zayachiy_sled.txt"
+            if ! grep -q '{{SUBSCRIPTION_URL}}' README.md; then
+              echo "README subscription URL already set - nothing to replace"
+              return 0
+            fi
+            python3 -c 'import os; s=open("README.md",encoding="utf-8").read(); s=s.replace("{{SUBSCRIPTION_URL}}",os.environ["VOLK_SUB"]); open("README.md","w",encoding="utf-8").write(s)'
+            if grep -q '{{SUBSCRIPTION_URL}}' README.md; then
+              echo "FATAL: README still has the placeholder after replace"
+              return 1
+            fi
+            echo "README subscription URL set to: $VOLK_SUB"
+            echo "### README subscription: $VOLK_SUB" >> $GITHUB_STEP_SUMMARY
+          }
+          echo "Starting cloudflared quick tunnel to vmess-ws ..."
+          rm -f /tmp/cf.log
+          cloudflared tunnel --url http://localhost:10086 > /tmp/cf.log 2>&1 &
+          echo $! > /tmp/cf.pid
+          CF_HOST=""
+          for _w in $(seq 1 12); do
+            sleep 10
+            CF_HOST=$(grep -oE "https://[a-z0-9-]+\.trycloudflare\.com" /tmp/cf.log 2>/dev/null | head -1 | sed 's|https://||')
+            if [ -n "$CF_HOST" ]; then break; fi
+            echo "tunnel URL not yet published ($_w/12) - waiting ..."
+          done
+          cat /tmp/cf.log
+          if [ -z "$CF_HOST" ]; then echo "FATAL: cloudflared gave no URL"; exit 1; fi
+          echo "$CF_HOST" > medvezhiy_sled.txt
+          echo "TUNNEL: $CF_HOST"
+          _m1
+          _u2
+          git config user.name "medved-bot"
+          git config user.email "bot@taiga.volk"
+          git pull --rebase --autostash || true
+          # Bury the dead transports: remove their endpoint files + mesh key.
+          git rm --quiet bore_url.txt ss_url.txt ss_ygg_url.txt proxy_urls.txt 2>/dev/null || true
+          git rm -r --quiet ygg-node 2>/dev/null || true
+          git add medvezhiy_sled.txt volchiy_sled.txt zayachiy_sled.txt README.md || true
+          git commit -m "publish cloudflared $CF_HOST" || true
+          _push || true
+          echo "### CLOUDFLARE: $CF_HOST" >> $GITHUB_STEP_SUMMARY
+
+      - name: Taezhnaya proverka (sled volka)
+        run: |
+          CF_HOST="$(cat medvezhiy_sled.txt 2>/dev/null | tr -d ' \r\n')"
+          [ -z "$CF_HOST" ] && { echo "FATAL: no tunnel hostname"; exit 1; }
+          UUID="$(python3 -c "import json;print(json.load(open('matryoshka_dvigatel.json'))['inbounds'][0]['users'][0]['uuid'])")"
+          printf '{"log":{"level":"info"},"inbounds":[{"type":"socks","tag":"in","listen":"127.0.0.1","listen_port":1082}],"outbounds":[{"type":"vmess","tag":"out","server":"%s","server_port":443,"uuid":"%s","alter_id":0,"tls":{"enabled":true,"server_name":"%s"},"transport":{"type":"ws","path":"/taiga","headers":{"Host":"%s"}}}]}' "$CF_HOST" "$UUID" "$CF_HOST" "$CF_HOST" > /tmp/sb-sled.json
+          /tmp/sing-box run -c /tmp/sb-sled.json > /tmp/sb-cf.log 2>&1 &
+          sleep 3
+          echo "--- vmess: http via socks-1082 (single probe, DNS-wait retry) ---"
+          # NOTE: fresh trycloudflare hostnames need 30-90s for DNS to
+          # propagate (NXDOMAIN right after creation is normal, NOT a bug).
+          # Same single probe, just retried with backoff - no extra traffic
+          # once healthy, zero user impact.
+          _ok=0
+          for _t in 1 2 3 4 5 6 7 8; do
+            if curl -s --max-time 20 --socks5-hostname 127.0.0.1:1082 http://httpbin.org/ip; then
+              echo ""; echo "CF LEG OK (real traffic)"; _ok=1; break
+            fi
+            echo "attempt $_t/8: tunnel DNS/traffic not ready yet - waiting 15s ..."
+            sleep 15
+          done
+          if [ "$_ok" != "1" ]; then
+            echo "FATAL: CF LEG FAIL"; tail -20 /tmp/sb-cf.log || true; tail -20 /tmp/cf.log || true; exit 1
+          fi
+          pkill -f sb-sled.json 2>/dev/null || true
+          echo "ALL LOOPBACK TESTS OK"
+
+      - name: Zimnyaya storozhka (nochnoy dozor)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          OWN_HOST="$(cat medvezhiy_sled.txt 2>/dev/null | tr -d ' \r\n')"
+          _t0="$(cat /tmp/job_start 2>/dev/null || date +%s)"
+          _dispatch_at=14100  # 3h55m job-elapsed: dispatch the successor generation
+          echo "own tunnel host: ${OWN_HOST:-none} | job start epoch: $_t0"
+          _push_change() {
+            # Push published files; one rebase+retry. Never kills the monitor.
+            git push && return 0
+            echo "push failed ($1) - rebasing and retrying once ..."
+            git rebase --abort 2>/dev/null || true
+            git pull --rebase --autostash || { echo "WARNING: rebase failed ($1) - NOT published"; echo "### ⚠️ publish failed ($1) - README link may be stale" >> $GITHUB_STEP_SUMMARY; return 1; }
+            git add medvezhiy_sled.txt volchiy_sled.txt zayachiy_sled.txt README.md || return 1
+            if git diff --cached --quiet; then
+              echo "nothing to commit after rebase - remote already up to date"
+              return 0
+            fi
+            git commit -m "$1 [${OWN_HOST:-unknown}] (retry)" || return 1
+            git push || { echo "WARNING: push retry failed ($1) - NOT published"; echo "### ⚠️ publish failed ($1) - README link may be stale" >> $GITHUB_STEP_SUMMARY; return 1; }
+          }
+          _m0() {
+            CF_HOST="$(cat medvezhiy_sled.txt 2>/dev/null | tr -d ' \r\n')"
+            [ -z "$CF_HOST" ] && return 0
+            UUID="$(python3 -c "import json;print(json.load(open('matryoshka_dvigatel.json'))['inbounds'][0]['users'][0]['uuid'])")"
+            [ -z "$UUID" ] && return 0
+            VJSON=$(printf '{"v":"2","ps":"VOLK-TAYGA","add":"%s","port":"443","id":"%s","aid":"0","net":"ws","type":"none","host":"%s","path":"/taiga","tls":"tls"}' "$CF_HOST" "$UUID" "$CF_HOST")
+            LINK="vmess://$(printf '%s' "$VJSON" | base64 -w0)"
+            printf '%s' "$LINK" > volchiy_sled.txt
+            printf '%s' "$LINK" | base64 -w0 > zayachiy_sled.txt
+          }
+          _p1() {
+            # $1 = reason label (handover | heal), $2 = "reassert" to win over
+            # a stale hostname pushed by the predecessor during handover
+            git config user.name "medved-bot" || true
+            git config user.email "bot@taiga.volk" || true
+            git pull --rebase --autostash || true
+            if [ "$2" = "reassert" ] && [ -n "$OWN_HOST" ]; then
+              printf '%s' "$OWN_HOST" > medvezhiy_sled.txt
+            fi
+            _m0
+            git rm --quiet bore_url.txt ss_url.txt ss_ygg_url.txt proxy_urls.txt 2>/dev/null || true
+            git rm -r --quiet ygg-node 2>/dev/null || true
+            git add medvezhiy_sled.txt volchiy_sled.txt zayachiy_sled.txt README.md || true
+            git commit -m "cloudflare ${1:-update} [${OWN_HOST:-unknown}]" || true
+            _push_change "cloudflare ${1:-update}" || true
+          }
+          # Monitor: persistent vmess-over-cloudflared on 1081,
+          # rebuilt whenever the published hostname changes. Real
+          # end-to-end traffic (not a TCP ping) decides health.
+          _s2() {
+            _h="$1"
+            UUID="$(python3 -c "import json;print(json.load(open('matryoshka_dvigatel.json'))['inbounds'][0]['users'][0]['uuid'])")"
+            printf '{"log":{"level":"error"},"inbounds":[{"type":"socks","tag":"in","listen":"127.0.0.1","listen_port":1081}],"outbounds":[{"type":"vmess","tag":"out","server":"%s","server_port":443,"uuid":"%s","alter_id":0,"tls":{"enabled":true,"server_name":"%s"},"transport":{"type":"ws","path":"/taiga","headers":{"Host":"%s"}}}]}' "$_h" "$UUID" "$_h" "$_h" > /tmp/sb-dozor.json
+            pkill -f sb-dozor.json 2>/dev/null || true
+            sleep 1
+            /tmp/sing-box run -c /tmp/sb-dozor.json > /tmp/sb-dozitor.log 2>&1 &
+            echo "$_h" > /tmp/sldozor.ep
+            sleep 2
+            echo "monitor (re)started on 1081 -> $_h"
+          }
+          _v3() {
+            # Single lightweight probe per tick (was 2) to stay under rate limits.
+            # 429 = edge concurrency cap -> rotate now.
+            _c=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 --socks5-hostname 127.0.0.1:1081 http://httpbin.org/ip 2>/dev/null || echo "000")
+            if [ "$_c" = "429" ]; then
+              echo "edge 429 (concurrency cap) - rotating now"
+              return 1
+            fi
+            [ "$_c" = "200" ] && return 0
+            return 1
+          }
+          _r4() {
+            # New quick tunnel = new random hostname. Old one stays briefly
+            # (cloudflared keeps serving until killed + edge drains), the
+            # client follows the republished file within a minute.
+            echo "RESTARTING cloudflared tunnel ..."
+            kill $(cat /tmp/cf.pid) 2>/dev/null || true
+            sleep 2
+            rm -f /tmp/cf.log
+            cloudflared tunnel --url http://localhost:10086 > /tmp/cf.log 2>&1 &
+            echo $! > /tmp/cf.pid
+            CF_NEW=""
+            for _w in $(seq 1 12); do
+              sleep 10
+              CF_NEW=$(grep -oE "https://[a-z0-9-]+\.trycloudflare\.com" /tmp/cf.log 2>/dev/null | head -1 | sed 's|https://||')
+              if [ -n "$CF_NEW" ]; then break; fi
+              echo "new tunnel URL not yet published ($_w/12) ..."
+            done
+            if [ -z "$CF_NEW" ]; then
+              echo "new tunnel failed - keeping old endpoint file"
+              cat /tmp/cf.log || true
+              return 1
+            fi
+            echo "$CF_NEW" > medvezhiy_sled.txt
+            echo "new tunnel: $CF_NEW"
+            return 0
+          }
+          _s2 "$(cat medvezhiy_sled.txt 2>/dev/null | tr -d ' \r\n')"
+          fail_cf=0; _trouble=0
+          for i in $(seq 1 400); do
+            echo "[$i] $(date -u) - alive"
+            # --- generational handover: dispatch successor at 3h55m job-elapsed ---
+            if [ ! -f /tmp/successor_dispatched ]; then
+              _now=$(date +%s)
+              if [ $((_now - _t0)) -ge "$_dispatch_at" ]; then
+                echo "3h55m elapsed - dispatching successor generation ..."
+                if gh workflow run sibirskiy_medved.yml --repo "$GITHUB_REPOSITORY" --ref main; then
+                  date > /tmp/successor_dispatched
+                  echo "successor dispatched - it will cancel this run once verified"
+                else
+                  echo "successor dispatch failed - will retry next tick"
+                fi
+              fi
+            fi
+            # --- generational handover (first iteration only) ---
+            if [ "$i" -eq 1 ]; then
+              for _rid in $(gh run list --repo "$GITHUB_REPOSITORY" \
+                  --workflow sibirskiy_medved.yml --status in_progress --limit 10 \
+                  --json databaseId -q '.[].databaseId' 2>/dev/null); do
+                if [ -n "$_rid" ] && [ "$_rid" -lt "$GITHUB_RUN_ID" ] 2>/dev/null; then
+                  echo "retiring older run $_rid (our tunnel verified+published) ..."
+                  gh run cancel "$_rid" --repo "$GITHUB_REPOSITORY" || true
+                fi
+              done
+              _p1 "handover" reassert
+              echo "HANDOVER: predecessors retired, own endpoint republished."
+            fi
+            CF_HOST="$(cat medvezhiy_sled.txt 2>/dev/null | tr -d ' \r\n')"
+            # Silent healthy ticks: publish status only every 4th tick to cut log/API noise.
+            # Proxy traffic itself is untouched (zero user impact).
+            if [ $((i % 4)) -eq 1 ]; then echo "CLOUDFLARE: ${CF_HOST:-none}"; fi
+            _pids=""
+            for svc in "ss:/tmp/ss.pid" "cf:/tmp/cf.pid"; do
+              name=$(echo $svc | cut -d: -f1); pidf=$(echo $svc | cut -d: -f2)
+              if kill -0 $(cat $pidf) 2>/dev/null; then _pids="$_pids $name=ok"; else _pids="$_pids $name=DEAD"; _trouble=1; fi
+            done
+            if pgrep -f sb-dozor.json >/dev/null 2>&1; then _pids="$_pids sldozor=ok"; else _pids="$_pids sldozor=DEAD"; _trouble=1; fi
+            (ss -tln 2>/dev/null || netstat -tln 2>/dev/null) | grep -q ":10086" || { echo "vmess listen DEAD"; _trouble=1; }
+            # Rebuild the monitor if it died or the hostname changed.
+            if ! pgrep -f sb-dozor.json >/dev/null 2>&1 \
+              || [ "$(cat /tmp/sldozor.ep 2>/dev/null)" != "$CF_HOST" ]; then
+              [ -n "$CF_HOST" ] && _s2 "$CF_HOST"
+            fi
+            if _v3; then
+              fail_cf=0
+              if [ $((i % 4)) -eq 1 ]; then echo "public vmess end-to-end ok"; fi
+            else
+              echo "public vmess end-to-end FAIL ($((fail_cf+1)))"; fail_cf=$((fail_cf+1)); _trouble=1
+            fi
+            # --- auto-heal on FIRST failure: fresh tunnel + republish ---
+            if [ "$fail_cf" -ge 1 ]; then
+              if _r4; then
+                CF_HOST="$(cat medvezhiy_sled.txt 2>/dev/null | tr -d ' \r\n')"
+                _s2 "$CF_HOST"
+                if _v3; then
+                  _p1 "heal"
+                  echo "HEALED: new tunnel $CF_HOST verified end-to-end"
+                else
+                  echo "new tunnel up but traffic dead - will retry next round"
+                fi
+              else
+                echo "tunnel restart failed - will retry next round"
+              fi
+              fail_cf=0
+            fi
+            # Diagnostics ONLY on trouble (healthy loops stay one screen).
+            if [ "$_trouble" -eq 1 ]; then
+              _trouble=0
+              echo "--- ss.log tail ---"; tail -5 /tmp/ss.log || true
+              echo "--- cf.log tail ---"; tail -10 /tmp/cf.log || true
+              echo "--- sb-dozitor.log tail ---"; tail -5 /tmp/sb-dozitor.log || true
+            fi
+            sleep 60
+          done
+
+      - name: Self-Healing Loop (re-trigger before timeout)
+        # if: always() so this dispatches even if the monitor step failed
+        # or the job was timed out earlier than expected.
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -f /tmp/successor_dispatched ]; then
+            echo "successor already dispatched during the 3h55m handover tick - nothing to do"
+            exit 0
+          fi
+          echo "fallback: monitor loop ended without a successor - dispatching now ..."
+          gh workflow run sibirskiy_medved.yml --repo "$GITHUB_REPOSITORY" --ref main \
+            && echo "fallback dispatch OK" \
+            || echo "fallback dispatch failed (nochnoy_dozor watchdog will retry)"

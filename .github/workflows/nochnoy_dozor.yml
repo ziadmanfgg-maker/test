@@ -1,0 +1,73 @@
+name: Nochnoy Dozor (storozh taygi)
+
+# Safety net. Layered restart for Sibirskiy Medved:
+#   1. workflow_run fires within minutes when a USER-triggered medved run
+#      completes (GITHUB_TOKEN-dispatched parents do NOT emit downstream
+#      events, verified 2026-11-17) - covers manual re-runs.
+#   2. cron backstop every 30 min catches any death the in-job 3h55m
+#      handover missed (template repos skip themselves instantly).
+#   3. The proxy chain itself rides on the in-job handover + self-healing
+#      tail step (see sibirskiy_medved.yml). This workflow only re-arms
+#      the chain when it has fully broken.
+
+on:
+  workflow_run:
+    workflows: ["Sibirskiy Medved (dozor taygi)"]
+    types: [completed]
+  schedule:
+    - cron: '23,53 * * * *'  # backstop only
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+# Serialise backstop firings with workflow_run firings - no double dispatch.
+concurrency:
+  group: nochnoy-dozor
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    if: github.repository != 'X5Coder/IPNET'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Restart proxy if no run is active
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          C0: ${{ github.event_name }}
+          C1: ${{ github.event.workflow_run.conclusion }}
+        run: |
+          echo "=== Nochnoy Dozor Watch Start ==="
+          echo "trigger: $C0 | parent conclusion: ${C1:-n/a}"
+          echo "Checking for active sibirskiy_medved runs (in_progress/queued/waiting)..."
+          N1=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow sibirskiy_medved.yml \
+            --status in_progress --limit 1 --json databaseId -q 'length')
+          N2=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow sibirskiy_medved.yml \
+            --status queued --limit 1 --json databaseId -q 'length')
+          N3=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow sibirskiy_medved.yml \
+            --status waiting --limit 1 --json databaseId -q 'length')
+          N=$(( ${N1:-0} + ${N2:-0} + ${N3:-0} ))
+          if [ "${N:-0}" -ge 1 ]; then
+            echo "✓ Proxy run ACTIVE (${N} run(s) in progress) - nothing to do."
+            exit 0
+          fi
+          echo "✗ No active proxy run found - attempting to dispatch fresh run..."
+          # Retry logic: try up to 3 times with 1-minute backoff
+          for attempt in 1 2 3; do
+            echo "Dispatch attempt ${attempt}/3..."
+            if gh workflow run sibirskiy_medved.yml --repo "$GITHUB_REPOSITORY" --ref main; then
+              echo "✓ Dispatch SUCCESS - new run started"
+              exit 0
+            else
+              echo "✗ Dispatch attempt ${attempt} failed"
+              if [ $attempt -lt 3 ]; then
+                echo "Waiting 60 seconds before retry..."
+                sleep 60
+              fi
+            fi
+          done
+          echo "✗ All dispatch attempts failed - will retry on next event/tick"
+          echo "Possible causes: workflow disabled, repo not public, or GitHub API rate limit"
+          exit 1
